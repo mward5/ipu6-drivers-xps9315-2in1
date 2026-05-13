@@ -1412,18 +1412,37 @@ static int s5k3j1_get_pm_resources(struct device *dev)
 		return dev_err_probe(dev, PTR_ERR(s5k3j1->reset),
 				     "failed to get reset gpio\n");
 
-	s5k3j1->img_clk = devm_clk_get_optional(dev, NULL);
-	if (IS_ERR(s5k3j1->img_clk))
-		return dev_err_probe(dev, PTR_ERR(s5k3j1->img_clk),
-				     "failed to get imaging clock\n");
+	/*
+	 * INT346D on PMIC platforms (e.g. Dell XPS 13 9315 2-in-1): regulators and
+	 * clocks are registered by tps68470 MFD after i2c-INT3472 probes. Optional
+	 * get returns -ENODEV and probe runs unpowered; require supplies so we
+	 * -EPROBE_DEFER until int3472 board-data has registered them.
+	 */
+	if (ACPI_COMPANION(dev) &&
+	    !strcmp(acpi_device_hid(ACPI_COMPANION(dev)), "INT346D")) {
+		s5k3j1->img_clk = devm_clk_get(dev, NULL);
+		if (IS_ERR(s5k3j1->img_clk))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->img_clk),
+					     "failed to get imaging clock\n");
 
-	s5k3j1->avdd = devm_regulator_get_optional(dev, "avdd");
-	if (IS_ERR(s5k3j1->avdd)) {
-		ret = PTR_ERR(s5k3j1->avdd);
-		s5k3j1->avdd = NULL;
-		if (ret != -ENODEV)
-			return dev_err_probe(dev, ret,
+		s5k3j1->avdd = devm_regulator_get(dev, "avdd");
+		if (IS_ERR(s5k3j1->avdd))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->avdd),
 					     "failed to get avdd regulator\n");
+	} else {
+		s5k3j1->img_clk = devm_clk_get_optional(dev, NULL);
+		if (IS_ERR(s5k3j1->img_clk))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->img_clk),
+					     "failed to get imaging clock\n");
+
+		s5k3j1->avdd = devm_regulator_get_optional(dev, "avdd");
+		if (IS_ERR(s5k3j1->avdd)) {
+			ret = PTR_ERR(s5k3j1->avdd);
+			s5k3j1->avdd = NULL;
+			if (ret != -ENODEV)
+				return dev_err_probe(dev, ret,
+						     "failed to get avdd regulator\n");
+		}
 	}
 
 	return 0;
