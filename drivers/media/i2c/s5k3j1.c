@@ -706,6 +706,44 @@ static const struct s5k3j1_reg mode_3976x2736_regs[] = {
 	{0x6214, 0x7970},
 };
 
+/*
+ * PDAF trial (Dell XPS 9315 rear / Windows PDAFType2 + 3968x684 PAF region).
+ * Default mode uses 0x0b84=0x0201, 0x0900=0x0221; trial 1 clears PDAF-ish blocks.
+ * Trial 2 raises frame length (VTS) toward 2736+684 for embedded PDAF lines.
+ * Module param pdaf_trial: 0=off, 1=disable, 2=taller VTS (see MODULE_PARM_DESC).
+ */
+#define S5K3J1_VTS_30FPS_PD_AF		0x0d5c	/* 3420 = 2736 + 684 */
+
+static const struct s5k3j1_reg s5k3j1_pdaf_disable_regs[] = {
+	{0xfcfc, 0x4000},
+	{0x0b80, 0x0000},
+	{0x0b84, 0x0000},
+	{0x0900, 0x0200},
+};
+
+static const struct s5k3j1_reg s5k3j1_pdaf_tall_vts_regs[] = {
+	{0xfcfc, 0x4000},
+	{0x0b80, 0x0000},
+	{0x0b84, 0x0000},
+	{0x0340, S5K3J1_VTS_30FPS_PD_AF},
+};
+
+static const struct s5k3j1_reg_list s5k3j1_pdaf_disable_reg_list = {
+	.num_of_regs = ARRAY_SIZE(s5k3j1_pdaf_disable_regs),
+	.regs = s5k3j1_pdaf_disable_regs,
+};
+
+static const struct s5k3j1_reg_list s5k3j1_pdaf_tall_vts_reg_list = {
+	.num_of_regs = ARRAY_SIZE(s5k3j1_pdaf_tall_vts_regs),
+	.regs = s5k3j1_pdaf_tall_vts_regs,
+};
+
+/* Default 0: stock mode; set pdaf_trial=1|2 to experiment (does not fix ISYS capture alone). */
+static int pdaf_trial;
+module_param(pdaf_trial, int, 0644);
+MODULE_PARM_DESC(pdaf_trial,
+		 "PDAF trial for INT346D rear: 0=default, 1=disable regs, 2=taller VTS");
+
 static const char * const s5k3j1_test_pattern_menu[] = {
 	"Disabled",
 	"solid colour",
@@ -1293,6 +1331,33 @@ err_dovdd:
 	return ret;
 }
 
+static int s5k3j1_apply_pdaf_trial(struct s5k3j1 *s5k3j1)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&s5k3j1->sd);
+	const struct s5k3j1_reg_list *list;
+	int ret;
+
+	switch (pdaf_trial) {
+	case 1:
+		list = &s5k3j1_pdaf_disable_reg_list;
+		break;
+	case 2:
+		list = &s5k3j1_pdaf_tall_vts_reg_list;
+		break;
+	default:
+		return 0;
+	}
+
+	ret = s5k3j1_write_reg_list(s5k3j1, list);
+	if (ret)
+		dev_err(&client->dev, "PDAF trial %d register write failed: %d\n",
+			pdaf_trial, ret);
+	else
+		dev_info(&client->dev, "applied PDAF trial %d\n", pdaf_trial);
+
+	return ret;
+}
+
 static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&s5k3j1->sd);
@@ -1331,6 +1396,10 @@ static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
 		dev_err(&client->dev, "%s failed to set mode\n", __func__);
 		return ret;
 	}
+
+	ret = s5k3j1_apply_pdaf_trial(s5k3j1);
+	if (ret)
+		return ret;
 
 	/* Apply customized values from user */
 	ret =  __v4l2_ctrl_handler_setup(s5k3j1->sd.ctrl_handler);
