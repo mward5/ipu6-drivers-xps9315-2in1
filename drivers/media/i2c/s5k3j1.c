@@ -65,6 +65,22 @@
 /* Test Pattern Control */
 #define S5K3J1_REG_TEST_PATTERN		0x0600
 
+/* Native / pixel array geometry (libcamera selection targets) */
+#define S5K3J1_NATIVE_WIDTH		3976U
+#define S5K3J1_NATIVE_HEIGHT		2736U
+#define S5K3J1_PIXEL_ARRAY_LEFT		0U
+#define S5K3J1_PIXEL_ARRAY_TOP		0U
+#define S5K3J1_PIXEL_ARRAY_WIDTH	S5K3J1_NATIVE_WIDTH
+#define S5K3J1_PIXEL_ARRAY_HEIGHT	S5K3J1_NATIVE_HEIGHT
+
+/*
+ * Windows graph_settings_S5K3J1SX04_* crops 4px per side before ISP (3976 -> 3968).
+ * libcamera configures 3968x2736 for LNK0; use this as the default active crop.
+ */
+#define S5K3J1_ACTIVE_LEFT		4U
+#define S5K3J1_ACTIVE_WIDTH		3968U
+#define S5K3J1_ACTIVE_HEIGHT		S5K3J1_NATIVE_HEIGHT
+
 struct s5k3j1_reg {
 	u16 address;
 	u16 val;
@@ -757,7 +773,10 @@ struct s5k3j1 {
 
 	struct clk *img_clk;
 	struct regulator *avdd;
+	struct regulator *dvdd;
+	struct regulator *dovdd;
 	struct gpio_desc *reset;
+	struct gpio_desc *powerdown;
 
 	/* V4L2 Controls */
 	struct v4l2_ctrl *link_freq;
@@ -888,7 +907,15 @@ static int s5k3j1_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	try_fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
 	try_fmt->field = V4L2_FIELD_NONE;
 
-	/* No crop or compose */
+	{
+		struct v4l2_rect *try_crop = v4l2_subdev_state_get_crop(fh->state, 0);
+
+		try_crop->left = S5K3J1_ACTIVE_LEFT;
+		try_crop->top = 0;
+		try_crop->width = S5K3J1_ACTIVE_WIDTH;
+		try_crop->height = S5K3J1_ACTIVE_HEIGHT;
+	}
+
 	mutex_unlock(&s5k3j1->mutex);
 
 	return 0;
@@ -1033,6 +1060,70 @@ static int s5k3j1_get_pad_format(struct v4l2_subdev *sd,
 	return ret;
 }
 
+static const struct v4l2_rect *
+__s5k3j1_get_pad_crop(struct s5k3j1 *s5k3j1,
+		      struct v4l2_subdev_state *sd_state,
+		      unsigned int pad,
+		      enum v4l2_subdev_format_whence which)
+{
+	switch (which) {
+	case V4L2_SUBDEV_FORMAT_TRY:
+		return v4l2_subdev_state_get_crop(sd_state, pad);
+	case V4L2_SUBDEV_FORMAT_ACTIVE: {
+		static struct v4l2_rect active_crop;
+
+		active_crop.left = S5K3J1_ACTIVE_LEFT;
+		active_crop.top = 0;
+		active_crop.width = S5K3J1_ACTIVE_WIDTH;
+		active_crop.height = S5K3J1_ACTIVE_HEIGHT;
+
+		return &active_crop;
+	}
+	default:
+		return NULL;
+	}
+}
+
+static int s5k3j1_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
+	const struct v4l2_rect *crop;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		crop = __s5k3j1_get_pad_crop(s5k3j1, sd_state, sel->pad, sel->which);
+		if (!crop)
+			return -EINVAL;
+
+		mutex_lock(&s5k3j1->mutex);
+		sel->r = *crop;
+		mutex_unlock(&s5k3j1->mutex);
+		return 0;
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = S5K3J1_NATIVE_WIDTH;
+		sel->r.height = S5K3J1_NATIVE_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = S5K3J1_PIXEL_ARRAY_LEFT;
+		sel->r.top = S5K3J1_PIXEL_ARRAY_TOP;
+		sel->r.width = S5K3J1_PIXEL_ARRAY_WIDTH;
+		sel->r.height = S5K3J1_PIXEL_ARRAY_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r.left = S5K3J1_ACTIVE_LEFT;
+		sel->r.top = 0;
+		sel->r.width = S5K3J1_ACTIVE_WIDTH;
+		sel->r.height = S5K3J1_ACTIVE_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int
 s5k3j1_set_pad_format(struct v4l2_subdev *sd,
 		       struct v4l2_subdev_state *sd_state,
@@ -1117,17 +1208,29 @@ static int s5k3j1_identify_module(struct s5k3j1 *s5k3j1)
 	return 0;
 }
 
+static bool s5k3j1_is_int346d_pmic_sensor(struct device *dev)
+{
+	struct acpi_device *adev = ACPI_COMPANION(dev);
+
+	return adev && !strcmp(acpi_device_hid(adev), "INT346D");
+}
+
 static int s5k3j1_power_off(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
 
 	gpiod_set_value_cansleep(s5k3j1->reset, 1);
+	gpiod_set_value_cansleep(s5k3j1->powerdown, 1);
+
+	clk_disable_unprepare(s5k3j1->img_clk);
 
 	if (s5k3j1->avdd)
 		regulator_disable(s5k3j1->avdd);
-
-	clk_disable_unprepare(s5k3j1->img_clk);
+	if (s5k3j1->dvdd)
+		regulator_disable(s5k3j1->dvdd);
+	if (s5k3j1->dovdd)
+		regulator_disable(s5k3j1->dovdd);
 
 	return 0;
 }
@@ -1138,26 +1241,56 @@ static int s5k3j1_power_on(struct device *dev)
 	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
 	int ret;
 
-	ret = clk_prepare_enable(s5k3j1->img_clk);
-	if (ret < 0) {
-		dev_err(dev, "failed to enable imaging clock: %d", ret);
-		return ret;
+	/* Hold sensor in reset/shutdown while rails and MCLK come up (TPS68470 GPIOs) */
+	gpiod_set_value_cansleep(s5k3j1->reset, 1);
+	gpiod_set_value_cansleep(s5k3j1->powerdown, 1);
+
+	if (s5k3j1->dovdd) {
+		ret = regulator_enable(s5k3j1->dovdd);
+		if (ret < 0) {
+			dev_err(dev, "failed to enable dovdd: %d", ret);
+			return ret;
+		}
+	}
+
+	if (s5k3j1->dvdd) {
+		ret = regulator_enable(s5k3j1->dvdd);
+		if (ret < 0) {
+			dev_err(dev, "failed to enable dvdd: %d", ret);
+			goto err_dovdd;
+		}
 	}
 
 	if (s5k3j1->avdd) {
 		ret = regulator_enable(s5k3j1->avdd);
 		if (ret < 0) {
 			dev_err(dev, "failed to enable avdd: %d", ret);
-			clk_disable_unprepare(s5k3j1->img_clk);
-			return ret;
+			goto err_dvdd;
 		}
 	}
 
+	ret = clk_prepare_enable(s5k3j1->img_clk);
+	if (ret < 0) {
+		dev_err(dev, "failed to enable imaging clock: %d", ret);
+		goto err_avdd;
+	}
+
+	gpiod_set_value_cansleep(s5k3j1->powerdown, 0);
 	gpiod_set_value_cansleep(s5k3j1->reset, 0);
-	/* 5ms to wait ready after XSHUTDN assert */
-	usleep_range(5000, 5500);
+	usleep_range(20000, 25000);
 
 	return 0;
+
+err_avdd:
+	if (s5k3j1->avdd)
+		regulator_disable(s5k3j1->avdd);
+err_dvdd:
+	if (s5k3j1->dvdd)
+		regulator_disable(s5k3j1->dvdd);
+err_dovdd:
+	if (s5k3j1->dovdd)
+		regulator_disable(s5k3j1->dovdd);
+	return ret;
 }
 
 static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
@@ -1204,9 +1337,15 @@ static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
 	if (ret)
 		return ret;
 
-	return s5k3j1_write_reg(s5k3j1, S5K3J1_REG_MODE_SELECT,
+	ret = s5k3j1_write_reg(s5k3j1, S5K3J1_REG_MODE_SELECT,
 				 S5K3J1_REG_VALUE_08BIT,
 				 S5K3J1_MODE_STREAMING);
+	if (!ret)
+		dev_info(&client->dev, "streaming: %ux%u link_freq_idx=%u\n",
+			 s5k3j1->cur_mode->width, s5k3j1->cur_mode->height,
+			 s5k3j1->cur_mode->link_freq_index);
+
+	return ret;
 }
 
 /* Stop streaming */
@@ -1243,12 +1382,16 @@ static int s5k3j1_set_stream(struct v4l2_subdev *sd, int enable)
 
 	mutex_unlock(&s5k3j1->mutex);
 
+	dev_info(&client->dev, "s_stream(%d): %d\n", enable, ret);
+
 	return ret;
 
 err_rpm_put:
 	pm_runtime_put(&client->dev);
 err_unlock:
 	mutex_unlock(&s5k3j1->mutex);
+
+	dev_info(&client->dev, "s_stream(%d): %d\n", enable, ret);
 
 	return ret;
 }
@@ -1273,6 +1416,7 @@ static const struct v4l2_subdev_pad_ops s5k3j1_pad_ops = {
 	.enum_mbus_code = s5k3j1_enum_mbus_code,
 	.get_fmt = s5k3j1_get_pad_format,
 	.set_fmt = s5k3j1_set_pad_format,
+	.get_selection = s5k3j1_get_selection,
 	.enum_frame_size = s5k3j1_enum_frame_size,
 };
 
@@ -1407,29 +1551,48 @@ static int s5k3j1_get_pm_resources(struct device *dev)
 	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
 	int ret;
 
-	s5k3j1->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(s5k3j1->reset))
-		return dev_err_probe(dev, PTR_ERR(s5k3j1->reset),
-				     "failed to get reset gpio\n");
-
 	/*
 	 * INT346D on PMIC platforms (e.g. Dell XPS 13 9315 2-in-1): regulators and
 	 * clocks are registered by tps68470 MFD after i2c-INT3472 probes. Optional
 	 * get returns -ENODEV and probe runs unpowered; require supplies so we
 	 * -EPROBE_DEFER until int3472 board-data has registered them.
 	 */
-	if (ACPI_COMPANION(dev) &&
-	    !strcmp(acpi_device_hid(ACPI_COMPANION(dev)), "INT346D")) {
+	if (s5k3j1_is_int346d_pmic_sensor(dev)) {
+		s5k3j1->powerdown = devm_gpiod_get(dev, "powerdown", GPIOD_OUT_LOW);
+		if (IS_ERR(s5k3j1->powerdown))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->powerdown),
+					     "failed to get powerdown gpio\n");
+
+		s5k3j1->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(s5k3j1->reset))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->reset),
+					     "failed to get reset gpio\n");
+
 		s5k3j1->img_clk = devm_clk_get(dev, NULL);
 		if (IS_ERR(s5k3j1->img_clk))
 			return dev_err_probe(dev, PTR_ERR(s5k3j1->img_clk),
 					     "failed to get imaging clock\n");
+
+		s5k3j1->dovdd = devm_regulator_get(dev, "dovdd");
+		if (IS_ERR(s5k3j1->dovdd))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->dovdd),
+					     "failed to get dovdd regulator\n");
+
+		s5k3j1->dvdd = devm_regulator_get(dev, "dvdd");
+		if (IS_ERR(s5k3j1->dvdd))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->dvdd),
+					     "failed to get dvdd regulator\n");
 
 		s5k3j1->avdd = devm_regulator_get(dev, "avdd");
 		if (IS_ERR(s5k3j1->avdd))
 			return dev_err_probe(dev, PTR_ERR(s5k3j1->avdd),
 					     "failed to get avdd regulator\n");
 	} else {
+		s5k3j1->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(s5k3j1->reset))
+			return dev_err_probe(dev, PTR_ERR(s5k3j1->reset),
+					     "failed to get reset gpio\n");
+
 		s5k3j1->img_clk = devm_clk_get_optional(dev, NULL);
 		if (IS_ERR(s5k3j1->img_clk))
 			return dev_err_probe(dev, PTR_ERR(s5k3j1->img_clk),
