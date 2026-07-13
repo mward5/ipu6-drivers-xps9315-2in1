@@ -14,6 +14,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <media/mipi-csi2.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
@@ -80,6 +81,11 @@
 #define S5K3J1_ACTIVE_LEFT		4U
 #define S5K3J1_ACTIVE_WIDTH		3968U
 #define S5K3J1_ACTIVE_HEIGHT		S5K3J1_NATIVE_HEIGHT
+
+/* Windows PDAFType2 / PAFi sideband (graph_settings_s5k3j1sx04_*). */
+#define S5K3J1_PDAF_WIDTH		S5K3J1_ACTIVE_WIDTH
+#define S5K3J1_PDAF_HEIGHT		684U
+#define S5K3J1_PDAF_STREAM		1
 
 struct s5k3j1_reg {
 	u16 address;
@@ -713,6 +719,7 @@ static const struct s5k3j1_reg mode_3976x2736_regs[] = {
  * Module param pdaf_trial: 0=off, 1=disable, 2=taller VTS (see MODULE_PARM_DESC).
  */
 #define S5K3J1_VTS_30FPS_PD_AF		0x0d5c	/* 3420 = 2736 + 684 */
+#define S5K3J1_VBLANK_PD_AF		684
 
 static const struct s5k3j1_reg s5k3j1_pdaf_disable_regs[] = {
 	{0xfcfc, 0x4000},
@@ -721,28 +728,21 @@ static const struct s5k3j1_reg s5k3j1_pdaf_disable_regs[] = {
 	{0x0900, 0x0200},
 };
 
-static const struct s5k3j1_reg s5k3j1_pdaf_tall_vts_regs[] = {
-	{0xfcfc, 0x4000},
-	{0x0b80, 0x0000},
-	{0x0b84, 0x0000},
-	{0x0340, S5K3J1_VTS_30FPS_PD_AF},
-};
-
 static const struct s5k3j1_reg_list s5k3j1_pdaf_disable_reg_list = {
 	.num_of_regs = ARRAY_SIZE(s5k3j1_pdaf_disable_regs),
 	.regs = s5k3j1_pdaf_disable_regs,
 };
 
-static const struct s5k3j1_reg_list s5k3j1_pdaf_tall_vts_reg_list = {
-	.num_of_regs = ARRAY_SIZE(s5k3j1_pdaf_tall_vts_regs),
-	.regs = s5k3j1_pdaf_tall_vts_regs,
-};
-
-/* Default 0: stock mode; set pdaf_trial=1|2 to experiment (does not fix ISYS capture alone). */
+/*
+ * pdaf_trial (INT346D rear only):
+ * 0 = PDAF regs from mode table + 684-line vblank (Windows PAFi height)
+ * 1 = disable PDAF register blocks, stock vblank
+ * 2 = disable PDAF + 684-line vblank
+ */
 static int pdaf_trial;
 module_param(pdaf_trial, int, 0644);
 MODULE_PARM_DESC(pdaf_trial,
-		 "PDAF trial for INT346D rear: 0=default, 1=disable regs, 2=taller VTS");
+		 "INT346D PDAF: 0=on+tall vblank, 1=disable, 2=disable+tall vblank");
 
 static const char * const s5k3j1_test_pattern_menu[] = {
 	"Disabled",
@@ -831,9 +831,33 @@ struct s5k3j1 {
 
 	/* True if the device has been identified */
 	bool identified;
+
+	/* Dell XPS 9315 rear camera (ACPI INT346D) */
+	bool int346d_rear;
 };
 
 #define to_s5k3j1(_sd)	container_of(_sd, struct s5k3j1, sd)
+
+static bool s5k3j1_pdaf_enabled(const struct s5k3j1 *s5k3j1)
+{
+	return s5k3j1->int346d_rear && pdaf_trial != 1;
+}
+
+static s32 s5k3j1_default_vblank(const struct s5k3j1 *s5k3j1)
+{
+	if (s5k3j1_pdaf_enabled(s5k3j1))
+		return S5K3J1_VBLANK_PD_AF;
+
+	return s5k3j1->cur_mode->vts_def - s5k3j1->cur_mode->height;
+}
+
+static void s5k3j1_update_pdaf_pad_format(struct v4l2_mbus_framefmt *fmt)
+{
+	fmt->width = S5K3J1_PDAF_WIDTH;
+	fmt->height = S5K3J1_PDAF_HEIGHT;
+	fmt->code = MEDIA_BUS_FMT_META_8;
+	fmt->field = V4L2_FIELD_NONE;
+}
 
 /* Read registers up to 4 at a time */
 static int s5k3j1_read_reg(struct s5k3j1 *s5k3j1,
@@ -1005,7 +1029,7 @@ static int s5k3j1_set_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_VBLANK:
 		ret = s5k3j1_write_reg(s5k3j1, S5K3J1_REG_VTS,
 					S5K3J1_REG_VALUE_16BIT,
-					ctrl->val);
+					s5k3j1->cur_mode->height + ctrl->val);
 		break;
 	case V4L2_CID_TEST_PATTERN:
 		ret = s5k3j1_write_reg(s5k3j1, S5K3J1_REG_TEST_PATTERN,
@@ -1032,8 +1056,19 @@ static int s5k3j1_enum_mbus_code(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_mbus_code_enum *code)
 {
-	/* Only one bayer order(GRBG) is supported */
-	if (code->index > 0)
+	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
+
+	if (code->pad > 0)
+		return -EINVAL;
+
+	if (code->stream == S5K3J1_PDAF_STREAM) {
+		if (!s5k3j1_pdaf_enabled(s5k3j1) || code->index > 0)
+			return -EINVAL;
+		code->code = MEDIA_BUS_FMT_META_8;
+		return 0;
+	}
+
+	if (code->stream > 0 || code->index > 0)
 		return -EINVAL;
 
 	code->code = MEDIA_BUS_FMT_SGRBG10_1X10;
@@ -1045,6 +1080,25 @@ static int s5k3j1_enum_frame_size(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_state *sd_state,
 				   struct v4l2_subdev_frame_size_enum *fse)
 {
+	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
+
+	if (fse->pad > 0)
+		return -EINVAL;
+
+	if (fse->stream == S5K3J1_PDAF_STREAM) {
+		if (!s5k3j1_pdaf_enabled(s5k3j1) ||
+		    fse->code != MEDIA_BUS_FMT_META_8 || fse->index > 0)
+			return -EINVAL;
+		fse->min_width = S5K3J1_PDAF_WIDTH;
+		fse->max_width = S5K3J1_PDAF_WIDTH;
+		fse->min_height = S5K3J1_PDAF_HEIGHT;
+		fse->max_height = S5K3J1_PDAF_HEIGHT;
+		return 0;
+	}
+
+	if (fse->stream > 0)
+		return -EINVAL;
+
 	if (fse->index >= ARRAY_SIZE(supported_modes))
 		return -EINVAL;
 
@@ -1074,8 +1128,24 @@ static int s5k3j1_do_get_pad_format(struct s5k3j1 *s5k3j1,
 {
 	struct v4l2_mbus_framefmt *framefmt;
 
+	if (fmt->stream == S5K3J1_PDAF_STREAM) {
+		if (!s5k3j1_pdaf_enabled(s5k3j1))
+			return -EINVAL;
+
+		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+			framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad,
+								fmt->stream);
+			fmt->format = *framefmt;
+		} else {
+			s5k3j1_update_pdaf_pad_format(&fmt->format);
+		}
+
+		return 0;
+	}
+
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad,
+							fmt->stream);
 		fmt->format = *framefmt;
 	} else {
 		s5k3j1_update_pad_format(s5k3j1->cur_mode, fmt);
@@ -1178,6 +1248,30 @@ s5k3j1_set_pad_format(struct v4l2_subdev *sd,
 
 	mutex_lock(&s5k3j1->mutex);
 
+	if (fmt->stream == S5K3J1_PDAF_STREAM) {
+		if (!s5k3j1_pdaf_enabled(s5k3j1)) {
+			mutex_unlock(&s5k3j1->mutex);
+			return -EINVAL;
+		}
+
+		if (fmt->format.code != MEDIA_BUS_FMT_META_8)
+			fmt->format.code = MEDIA_BUS_FMT_META_8;
+		s5k3j1_update_pdaf_pad_format(&fmt->format);
+
+		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+			framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad,
+								fmt->stream);
+			if (!framefmt) {
+				mutex_unlock(&s5k3j1->mutex);
+				return -EINVAL;
+			}
+			*framefmt = fmt->format;
+		}
+
+		mutex_unlock(&s5k3j1->mutex);
+		return 0;
+	}
+
 	/* Only one raw bayer(GRBG) order is supported */
 	if (fmt->format.code != MEDIA_BUS_FMT_SGRBG10_1X10)
 		fmt->format.code = MEDIA_BUS_FMT_SGRBG10_1X10;
@@ -1188,7 +1282,12 @@ s5k3j1_set_pad_format(struct v4l2_subdev *sd,
 				      fmt->format.width, fmt->format.height);
 	s5k3j1_update_pad_format(mode, fmt);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad,
+							fmt->stream);
+		if (!framefmt) {
+			mutex_unlock(&s5k3j1->mutex);
+			return -EINVAL;
+		}
 		*framefmt = fmt->format;
 	} else {
 		s5k3j1->cur_mode = mode;
@@ -1198,8 +1297,7 @@ s5k3j1_set_pad_format(struct v4l2_subdev *sd,
 		__v4l2_ctrl_s_ctrl_int64(s5k3j1->pixel_rate, pixel_rate);
 
 		/* Update limits and set FPS to default */
-		vblank_def = s5k3j1->cur_mode->vts_def -
-			     s5k3j1->cur_mode->height;
+		vblank_def = s5k3j1_default_vblank(s5k3j1);
 		vblank_min = s5k3j1->cur_mode->vts_min -
 			     s5k3j1->cur_mode->height;
 		__v4l2_ctrl_modify_range(s5k3j1->vblank, vblank_min,
@@ -1334,26 +1432,17 @@ err_dovdd:
 static int s5k3j1_apply_pdaf_trial(struct s5k3j1 *s5k3j1)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&s5k3j1->sd);
-	const struct s5k3j1_reg_list *list;
 	int ret;
 
-	switch (pdaf_trial) {
-	case 1:
-		list = &s5k3j1_pdaf_disable_reg_list;
-		break;
-	case 2:
-		list = &s5k3j1_pdaf_tall_vts_reg_list;
-		break;
-	default:
+	if (!s5k3j1->int346d_rear || pdaf_trial < 1)
 		return 0;
-	}
 
-	ret = s5k3j1_write_reg_list(s5k3j1, list);
+	ret = s5k3j1_write_reg_list(s5k3j1, &s5k3j1_pdaf_disable_reg_list);
 	if (ret)
-		dev_err(&client->dev, "PDAF trial %d register write failed: %d\n",
+		dev_err(&client->dev, "PDAF disable (trial %d) failed: %d\n",
 			pdaf_trial, ret);
 	else
-		dev_info(&client->dev, "applied PDAF trial %d\n", pdaf_trial);
+		dev_info(&client->dev, "PDAF disabled (trial %d)\n", pdaf_trial);
 
 	return ret;
 }
@@ -1410,11 +1499,39 @@ static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
 				 S5K3J1_REG_VALUE_08BIT,
 				 S5K3J1_MODE_STREAMING);
 	if (!ret)
-		dev_info(&client->dev, "streaming: %ux%u link_freq_idx=%u\n",
+		dev_info(&client->dev, "streaming: %ux%u vts=%u link_freq_idx=%u\n",
 			 s5k3j1->cur_mode->width, s5k3j1->cur_mode->height,
+			 s5k3j1->cur_mode->height + s5k3j1->vblank->val,
 			 s5k3j1->cur_mode->link_freq_index);
 
 	return ret;
+}
+
+static int s5k3j1_get_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
+				  struct v4l2_mbus_frame_desc *fd)
+{
+	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
+
+	if (pad > 0)
+		return -EINVAL;
+
+	fd->type = V4L2_MBUS_FRAME_DESC_TYPE_CSI2;
+	fd->num_entries = 1;
+	fd->entry[0].pixelcode = MEDIA_BUS_FMT_SGRBG10_1X10;
+	fd->entry[0].stream = 0;
+	fd->entry[0].bus.csi2.vc = 0;
+	fd->entry[0].bus.csi2.dt = MIPI_CSI2_DT_RAW10;
+
+	if (!s5k3j1_pdaf_enabled(s5k3j1))
+		return 0;
+
+	fd->num_entries = 2;
+	fd->entry[1].pixelcode = MEDIA_BUS_FMT_META_8;
+	fd->entry[1].stream = S5K3J1_PDAF_STREAM;
+	fd->entry[1].bus.csi2.vc = 1;
+	fd->entry[1].bus.csi2.dt = MIPI_CSI2_DT_EMBEDDED_8B;
+
+	return 0;
 }
 
 /* Stop streaming */
@@ -1487,6 +1604,7 @@ static const struct v4l2_subdev_pad_ops s5k3j1_pad_ops = {
 	.set_fmt = s5k3j1_set_pad_format,
 	.get_selection = s5k3j1_get_selection,
 	.enum_frame_size = s5k3j1_enum_frame_size,
+	.get_frame_desc = s5k3j1_get_frame_desc,
 };
 
 static const struct v4l2_subdev_ops s5k3j1_subdev_ops = {
@@ -1544,7 +1662,7 @@ static int s5k3j1_init_controls(struct s5k3j1 *s5k3j1)
 					      1, pixel_rate_max);
 
 	mode = s5k3j1->cur_mode;
-	vblank_def = mode->vts_def - mode->height;
+	vblank_def = s5k3j1_default_vblank(s5k3j1);
 	vblank_min = mode->vts_min - mode->height;
 	s5k3j1->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3j1_ctrl_ops,
 					  V4L2_CID_VBLANK,
@@ -1729,6 +1847,11 @@ static int s5k3j1_check_hwcfg(struct device *dev)
 		goto out_err;
 	}
 
+	dev_info(dev, "DEBUG: fwnode reports %u link freq(s):", bus_cfg.nr_of_link_frequencies);
+	for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++)
+		dev_info(dev, "DEBUG: link_frequencies[%u] = %lld", j, bus_cfg.link_frequencies[j]);
+	dev_info(dev, "DEBUG: driver expects %lld", link_freq_menu_items[0]);
+
 	for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); i++) {
 		for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++) {
 			if (link_freq_menu_items[i] ==
@@ -1769,6 +1892,7 @@ static int s5k3j1_probe(struct i2c_client *client)
 
 	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&s5k3j1->sd, client, &s5k3j1_subdev_ops);
+	s5k3j1->int346d_rear = s5k3j1_is_int346d_pmic_sensor(&client->dev);
 
 	ret = s5k3j1_get_pm_resources(&client->dev);
 	if (ret)
