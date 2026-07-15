@@ -752,8 +752,24 @@ static const char * const s5k3j1_test_pattern_menu[] = {
 	"PN9",
 };
 
-/* Configurations for supported link frequencies */
-#define S5K3J1_LINK_FREQ_848MHZ		848000000ULL
+/*
+ * Configurations for supported link frequencies.
+ *
+ * 512MHz (not the "848MHz" originally used here, a guessed default per the
+ * old comment "Intel default 848 MHz link (Mbps/lane in sensor regs)") is
+ * the value actually consistent with this driver's own per-mode timing:
+ * S5K3J1_PPL_512MHZ (4704) x S5K3J1_VTS_30FPS (2856) at the pixel rate
+ * link_freq_to_pixel_rate() computes for 512MHz (409.6 MP/s, i.e. 1024
+ * Mbps/lane via the driver's 2x-per-lane doubling - matching both the
+ * PPL_512MHZ name and the mipi_data_rate_1024mbps register table name)
+ * works out to ~30.5fps, matching the VTS_30FPS name. The old 848MHz value
+ * implies ~50.5fps at the same PPL/VTS - a D-PHY timing mismatch between
+ * what's declared to the CSI2 receiver and what the sensor actually
+ * transmits, diagnosed as the root cause of a real streaming bug (stream
+ * starts, no valid frames ever arrive, ISYS times out on stop/close) via
+ * live hardware testing - see docs/ in the camera-mipi project.
+ */
+#define S5K3J1_LINK_FREQ_512MHZ		512000000ULL
 #define S5K3J1_LINK_FREQ_INDEX_0	0
 
 #define S5K3J1_EXT_CLK			19200000
@@ -773,7 +789,7 @@ static u64 link_freq_to_pixel_rate(u64 f)
 
 /* Menu items for LINK_FREQ V4L2 control */
 static const s64 link_freq_menu_items[] = {
-	S5K3J1_LINK_FREQ_848MHZ
+	S5K3J1_LINK_FREQ_512MHZ
 };
 
 /* Link frequency configs */
