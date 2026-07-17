@@ -1372,8 +1372,15 @@ static int s5k3j1_power_off(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
 
-	gpiod_set_value_cansleep(s5k3j1->reset, 1);
+	/*
+	 * Assert order mirrors the release order swap in s5k3j1_power_on()
+	 * (powerdown-then-reset here, reset-then-powerdown to release) -
+	 * this direction isn't directly captured (the Windows trace only
+	 * covered a stream-start, not shutdown), so it's a symmetry
+	 * assumption, not independently verified like the release order is.
+	 */
 	gpiod_set_value_cansleep(s5k3j1->powerdown, 1);
+	gpiod_set_value_cansleep(s5k3j1->reset, 1);
 
 	clk_disable_unprepare(s5k3j1->img_clk);
 
@@ -1419,6 +1426,14 @@ static int s5k3j1_power_on(struct device *dev)
 			dev_err(dev, "failed to enable avdd: %d", ret);
 			goto err_dvdd;
 		}
+		/*
+		 * avdd (analog rail) settle time before the clock/PLL comes up.
+		 * No vendor datasheet timing available for this sensor; this is
+		 * an experiment to see whether the sensor's internal PLL needs
+		 * avdd stable before MCLK starts, given avdd was never actually
+		 * enabled prior to 2026-07-16 (see STATUS.md).
+		 */
+		usleep_range(2000, 3000);
 	}
 
 	ret = clk_prepare_enable(s5k3j1->img_clk);
@@ -1427,8 +1442,21 @@ static int s5k3j1_power_on(struct device *dev)
 		goto err_avdd;
 	}
 
-	gpiod_set_value_cansleep(s5k3j1->powerdown, 0);
+	/* Let MCLK/PLL stabilize before releasing the sensor from reset. */
+	usleep_range(1000, 2000);
+
+	/*
+	 * Fixed 2026-07-17: release order swapped to reset-then-powerdown,
+	 * matching a live Windows I2C capture of the TPS68470's SGPO register
+	 * during a real stream-start (see
+	 * docs/windows-agent-findings-i2c-mode-regs-2026-07-17.md) - Windows
+	 * releases reset (SGPO bit 2) before powerdown (SGPO bit 0); this
+	 * driver previously did the opposite. Not yet confirmed to matter,
+	 * but it's a real, independently-verified discrepancy against
+	 * genuinely-working hardware, not a guess.
+	 */
 	gpiod_set_value_cansleep(s5k3j1->reset, 0);
+	gpiod_set_value_cansleep(s5k3j1->powerdown, 0);
 	usleep_range(20000, 25000);
 
 	return 0;
