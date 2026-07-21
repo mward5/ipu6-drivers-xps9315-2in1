@@ -1891,11 +1891,6 @@ static int s5k3j1_check_hwcfg(struct device *dev)
 		goto out_err;
 	}
 
-	dev_info(dev, "DEBUG: fwnode reports %u link freq(s):", bus_cfg.nr_of_link_frequencies);
-	for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++)
-		dev_info(dev, "DEBUG: link_frequencies[%u] = %lld", j, bus_cfg.link_frequencies[j]);
-	dev_info(dev, "DEBUG: driver expects %lld", link_freq_menu_items[0]);
-
 	for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); i++) {
 		for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++) {
 			if (link_freq_menu_items[i] ==
