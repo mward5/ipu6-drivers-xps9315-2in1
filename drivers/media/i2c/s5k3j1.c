@@ -60,7 +60,17 @@
 
 #define S5K3J1_DGTL_GAIN_MIN		1024	     /* Min = 1 X */
 #define S5K3J1_DGTL_GAIN_MAX		(4096 - 1)   /* Max = 4 X */
-#define S5K3J1_DGTL_GAIN_DEFAULT	2560	     /* Default gain = 2.5 X */
+/*
+ * Default gain = 1 X (neutral). The libcamera soft-ISP "simple" pipeline
+ * driving this sensor only ever adjusts V4L2_CID_EXPOSURE and
+ * V4L2_CID_ANALOGUE_GAIN via its AGC loop - it never touches
+ * V4L2_CID_DIGITAL_GAIN. Anything other than unity here is a fixed,
+ * AGC-invisible brightness multiplier applied on every stream-on via
+ * __v4l2_ctrl_handler_setup(), which was leaving the sensor unable to
+ * expose correctly in bright scenes (confirmed: AGC pinned at its
+ * exposure/gain floor while still overexposed).
+ */
+#define S5K3J1_DGTL_GAIN_DEFAULT	1024	     /* Default gain = 1 X */
 #define S5K3J1_DGTL_GAIN_STEP		1	     /* Each step = 1/1024 */
 
 /* Test Pattern Control */
