@@ -1194,27 +1194,35 @@ static int s5k3j1_get_pad_format(struct v4l2_subdev *sd,
 	return ret;
 }
 
-static const struct v4l2_rect *
+static void s5k3j1_active_crop(struct v4l2_rect *r)
+{
+	r->left = S5K3J1_ACTIVE_LEFT;
+	r->top = 0;
+	r->width = S5K3J1_ACTIVE_WIDTH;
+	r->height = S5K3J1_ACTIVE_HEIGHT;
+}
+
+static int
 __s5k3j1_get_pad_crop(struct s5k3j1 *s5k3j1,
 		      struct v4l2_subdev_state *sd_state,
 		      unsigned int pad,
-		      enum v4l2_subdev_format_whence which)
+		      enum v4l2_subdev_format_whence which,
+		      struct v4l2_rect *crop)
 {
 	switch (which) {
-	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_state_get_crop(sd_state, pad);
-	case V4L2_SUBDEV_FORMAT_ACTIVE: {
-		static struct v4l2_rect active_crop;
+	case V4L2_SUBDEV_FORMAT_TRY: {
+		struct v4l2_rect *try_crop = v4l2_subdev_state_get_crop(sd_state, pad);
 
-		active_crop.left = S5K3J1_ACTIVE_LEFT;
-		active_crop.top = 0;
-		active_crop.width = S5K3J1_ACTIVE_WIDTH;
-		active_crop.height = S5K3J1_ACTIVE_HEIGHT;
-
-		return &active_crop;
+		if (!try_crop)
+			return -EINVAL;
+		*crop = *try_crop;
+		return 0;
 	}
+	case V4L2_SUBDEV_FORMAT_ACTIVE:
+		s5k3j1_active_crop(crop);
+		return 0;
 	default:
-		return NULL;
+		return -EINVAL;
 	}
 }
 
@@ -1223,18 +1231,21 @@ static int s5k3j1_get_selection(struct v4l2_subdev *sd,
 				struct v4l2_subdev_selection *sel)
 {
 	struct s5k3j1 *s5k3j1 = to_s5k3j1(sd);
-	const struct v4l2_rect *crop;
 
 	switch (sel->target) {
-	case V4L2_SEL_TGT_CROP:
-		crop = __s5k3j1_get_pad_crop(s5k3j1, sd_state, sel->pad, sel->which);
-		if (!crop)
-			return -EINVAL;
+	case V4L2_SEL_TGT_CROP: {
+		struct v4l2_rect crop;
+		int ret;
+
+		ret = __s5k3j1_get_pad_crop(s5k3j1, sd_state, sel->pad, sel->which, &crop);
+		if (ret)
+			return ret;
 
 		mutex_lock(&s5k3j1->mutex);
-		sel->r = *crop;
+		sel->r = crop;
 		mutex_unlock(&s5k3j1->mutex);
 		return 0;
+	}
 	case V4L2_SEL_TGT_NATIVE_SIZE:
 		sel->r.left = 0;
 		sel->r.top = 0;
@@ -1248,10 +1259,7 @@ static int s5k3j1_get_selection(struct v4l2_subdev *sd,
 		sel->r.height = S5K3J1_PIXEL_ARRAY_HEIGHT;
 		return 0;
 	case V4L2_SEL_TGT_CROP_DEFAULT:
-		sel->r.left = S5K3J1_ACTIVE_LEFT;
-		sel->r.top = 0;
-		sel->r.width = S5K3J1_ACTIVE_WIDTH;
-		sel->r.height = S5K3J1_ACTIVE_HEIGHT;
+		s5k3j1_active_crop(&sel->r);
 		return 0;
 	default:
 		return -EINVAL;
@@ -1553,10 +1561,10 @@ static int s5k3j1_start_streaming(struct s5k3j1 *s5k3j1)
 				 S5K3J1_REG_VALUE_08BIT,
 				 S5K3J1_MODE_STREAMING);
 	if (!ret)
-		dev_info(&client->dev, "streaming: %ux%u vts=%u link_freq_idx=%u\n",
-			 s5k3j1->cur_mode->width, s5k3j1->cur_mode->height,
-			 s5k3j1->cur_mode->height + s5k3j1->vblank->val,
-			 s5k3j1->cur_mode->link_freq_index);
+		dev_dbg(&client->dev, "streaming: %ux%u vts=%u link_freq_idx=%u\n",
+			s5k3j1->cur_mode->width, s5k3j1->cur_mode->height,
+			s5k3j1->cur_mode->height + s5k3j1->vblank->val,
+			s5k3j1->cur_mode->link_freq_index);
 
 	return ret;
 }
@@ -1606,7 +1614,7 @@ static int s5k3j1_set_stream(struct v4l2_subdev *sd, int enable)
 	if (enable) {
 		ret = pm_runtime_resume_and_get(&client->dev);
 		if (ret < 0)
-			goto err_unlock;
+			goto unlock;
 
 		/*
 		 * Apply default & customized values
@@ -1614,24 +1622,16 @@ static int s5k3j1_set_stream(struct v4l2_subdev *sd, int enable)
 		 */
 		ret = s5k3j1_start_streaming(s5k3j1);
 		if (ret)
-			goto err_rpm_put;
+			pm_runtime_put(&client->dev);
 	} else {
 		s5k3j1_stop_streaming(s5k3j1);
 		pm_runtime_put(&client->dev);
 	}
 
+unlock:
 	mutex_unlock(&s5k3j1->mutex);
 
-	dev_info(&client->dev, "s_stream(%d): %d\n", enable, ret);
-
-	return ret;
-
-err_rpm_put:
-	pm_runtime_put(&client->dev);
-err_unlock:
-	mutex_unlock(&s5k3j1->mutex);
-
-	dev_info(&client->dev, "s_stream(%d): %d\n", enable, ret);
+	dev_dbg(&client->dev, "s_stream(%d): %d\n", enable, ret);
 
 	return ret;
 }
