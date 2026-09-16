@@ -1574,11 +1574,33 @@ static int s5k3j1_get_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
 	if (!s5k3j1_pdaf_enabled(s5k3j1))
 		return 0;
 
+	/*
+	 * The PAF stream shares the image's virtual channel and is tagged with
+	 * user-defined data type 0. Both were guesses until 2026-09-16; both
+	 * are now taken from the Windows driver rather than assumed.
+	 *
+	 * s5k3j1sx04.sys installs two descriptor getters when its PDAF_Type
+	 * registry value is 2, and they declare the PAF stream as 3968x684 at
+	 * 30fps on data type 0x30, beside the image at 3976x2736. The
+	 * graph-settings XML shipped with that driver says PAFi 3968x684
+	 * independently, and 0x30 is what the mode table's second write to
+	 * 0x0116 programs.
+	 *
+	 * The virtual channel is measured rather than declared: counting
+	 * per-VC frame start and end in the receiver across both mode tables
+	 * shows traffic on VC0 only, never VC1.
+	 *
+	 * Getting the VC right matters beyond labelling. ipu6-isys keys its
+	 * firmware streams by virtual channel, so claiming VC1 would put this
+	 * stream on a different firmware stream from the image while the
+	 * queue count still expects both nodes on one - and buffers are then
+	 * withheld from both, with no error reported anywhere.
+	 */
 	fd->num_entries = 2;
 	fd->entry[1].pixelcode = MEDIA_BUS_FMT_META_8;
 	fd->entry[1].stream = S5K3J1_PDAF_STREAM;
-	fd->entry[1].bus.csi2.vc = 1;
-	fd->entry[1].bus.csi2.dt = MIPI_CSI2_DT_EMBEDDED_8B;
+	fd->entry[1].bus.csi2.vc = 0;
+	fd->entry[1].bus.csi2.dt = MIPI_CSI2_DT_USER_DEFINED(0);
 
 	return 0;
 }
