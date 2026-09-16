@@ -726,12 +726,7 @@ static const struct s5k3j1_reg mode_3976x2736_regs[] = {
 /*
  * PDAF trial (Dell XPS 9315 rear / Windows PDAFType2 + 3968x684 PAF region).
  * Default mode uses 0x0b84=0x0201, 0x0900=0x0221; trial 1 clears PDAF-ish blocks.
- * Trial 2 raises frame length (VTS) toward 2736+684 for embedded PDAF lines.
- * Module param pdaf_trial: 0=off, 1=disable, 2=taller VTS (see MODULE_PARM_DESC).
  */
-#define S5K3J1_VTS_30FPS_PD_AF		0x0d5c	/* 3420 = 2736 + 684 */
-#define S5K3J1_VBLANK_PD_AF		684
-
 static const struct s5k3j1_reg s5k3j1_pdaf_disable_regs[] = {
 	{0xfcfc, 0x4000},
 	{0x0b80, 0x0000},
@@ -746,14 +741,12 @@ static const struct s5k3j1_reg_list s5k3j1_pdaf_disable_reg_list = {
 
 /*
  * pdaf_trial (INT346D rear only):
- * 0 = PDAF regs from mode table + 684-line vblank (Windows PAFi height)
- * 1 = disable PDAF register blocks, stock vblank
- * 2 = disable PDAF + 684-line vblank
+ * 0 = leave the mode table's PDAF registers as they are
+ * 1 = disable the PDAF register blocks
  */
 static int pdaf_trial;
 module_param(pdaf_trial, int, 0644);
-MODULE_PARM_DESC(pdaf_trial,
-		 "INT346D PDAF: 0=on+tall vblank, 1=disable, 2=disable+tall vblank");
+MODULE_PARM_DESC(pdaf_trial, "INT346D PDAF: 0=on, 1=disable");
 
 static const char * const s5k3j1_test_pattern_menu[] = {
 	"Disabled",
@@ -867,15 +860,7 @@ struct s5k3j1 {
 
 static bool s5k3j1_pdaf_enabled(const struct s5k3j1 *s5k3j1)
 {
-	return s5k3j1->int346d_rear && pdaf_trial != 1;
-}
-
-static s32 s5k3j1_default_vblank(const struct s5k3j1 *s5k3j1)
-{
-	if (s5k3j1_pdaf_enabled(s5k3j1))
-		return S5K3J1_VBLANK_PD_AF;
-
-	return s5k3j1->cur_mode->vts_def - s5k3j1->cur_mode->height;
+	return s5k3j1->int346d_rear && !pdaf_trial;
 }
 
 static void s5k3j1_update_pdaf_pad_format(struct v4l2_mbus_framefmt *fmt)
@@ -1332,7 +1317,8 @@ s5k3j1_set_pad_format(struct v4l2_subdev *sd,
 		__v4l2_ctrl_s_ctrl_int64(s5k3j1->pixel_rate, pixel_rate);
 
 		/* Update limits and set FPS to default */
-		vblank_def = s5k3j1_default_vblank(s5k3j1);
+		vblank_def = s5k3j1->cur_mode->vts_def -
+			     s5k3j1->cur_mode->height;
 		vblank_min = s5k3j1->cur_mode->vts_min -
 			     s5k3j1->cur_mode->height;
 		__v4l2_ctrl_modify_range(s5k3j1->vblank, vblank_min,
@@ -1497,7 +1483,7 @@ static int s5k3j1_apply_pdaf_trial(struct s5k3j1 *s5k3j1)
 	struct i2c_client *client = v4l2_get_subdevdata(&s5k3j1->sd);
 	int ret;
 
-	if (!s5k3j1->int346d_rear || pdaf_trial < 1)
+	if (!s5k3j1->int346d_rear || !pdaf_trial)
 		return 0;
 
 	ret = s5k3j1_write_reg_list(s5k3j1, &s5k3j1_pdaf_disable_reg_list);
@@ -1717,7 +1703,7 @@ static int s5k3j1_init_controls(struct s5k3j1 *s5k3j1)
 					      1, pixel_rate_max);
 
 	mode = s5k3j1->cur_mode;
-	vblank_def = s5k3j1_default_vblank(s5k3j1);
+	vblank_def = mode->vts_def - mode->height;
 	vblank_min = mode->vts_min - mode->height;
 	s5k3j1->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3j1_ctrl_ops,
 					  V4L2_CID_VBLANK,
